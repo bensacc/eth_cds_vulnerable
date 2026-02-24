@@ -1,25 +1,40 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
+/**
+ * @title ETH Credit Default Swap
+ * @notice Simulates a CDS that pays out if ETH price drops below $1,500.
+ *
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !! INTENTIONALLY VULNERABLE CONTRACT - FOR SECURITY TESTING ONLY  !!
+ * !! DO NOT DEPLOY TO MAINNET OR ANY LIVE NETWORK                   !!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ *
+ * EMBEDDED VULNERABILITY: Classic reentrancy attack in claimPayout().
+ * The contract sends ETH *before* updating the caller's balance/state,
+ * allowing a malicious contract to recursively re-enter claimPayout()
+ * and drain the protection pool.
+ */
 
-// --------------------------------------------------------------------
-// Main CDS Contract
-// --------------------------------------------------------------------
+interface IOracle {
+    function getEthUsdPrice() external view returns (uint256); // price in USD * 1e8
+}
 
 contract EthCreditDefaultSwap {
 
+    // -------------------------------------------------------------------
+    // State
+    // -------------------------------------------------------------------
+
     address public owner;
-    UniswapV3TWAPOracle public oracle;
+    IOracle public oracle;
 
-    // Uniswap V3 USDC/WETH 0.05% pool on Ethereum mainnet
-    address public constant USDC_WETH_POOL = 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640;
-
-    uint256 public constant STRIKE_PRICE = 1_500 * 1e8; // $1,500 in 1e8 format
-    uint256 public constant PREMIUM_RATE = 0.01 ether;
-    uint256 public constant PERIOD       = 30 days;
+    uint256 public constant STRIKE_PRICE  = 1_500 * 1e8; // $1,500.00 in 1e8 format
+    uint256 public constant PREMIUM_RATE  = 0.01 ether;  // flat premium per period
+    uint256 public constant PERIOD        = 30 days;
 
     struct Position {
-        uint256 protectionAmount;
+        uint256 protectionAmount; // ETH amount covered
         uint256 premiumPaid;
         uint256 expiry;
         bool    active;
@@ -27,23 +42,35 @@ contract EthCreditDefaultSwap {
 
     mapping(address => Position) public positions;
     mapping(address => uint256)  public pendingPayouts;
-    uint256 public totalProtectionPool;
+
+    uint256 public totalProtectionPool; // ETH held as collateral by sellers
 
     event ProtectionBought(address indexed buyer, uint256 amount, uint256 expiry);
     event PayoutClaimed(address indexed buyer, uint256 amount);
     event PoolFunded(address indexed seller, uint256 amount);
 
-    constructor() {
+    // -------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------
+
+    constructor(address _oracle) {
         owner  = msg.sender;
-        // Deploy the oracle pointed at the canonical Uniswap V3 USDC/WETH pool
-        oracle = new UniswapV3TWAPOracle(USDC_WETH_POOL);
+        oracle = IOracle(_oracle);
     }
+
+    // -------------------------------------------------------------------
+    // Seller side: fund the protection pool
+    // -------------------------------------------------------------------
 
     function fundPool() external payable {
         require(msg.value > 0, "Must send ETH");
         totalProtectionPool += msg.value;
         emit PoolFunded(msg.sender, msg.value);
     }
+
+    // -------------------------------------------------------------------
+    // Buyer side: purchase protection
+    // -------------------------------------------------------------------
 
     function buyProtection(uint256 protectionAmount) external payable {
         require(msg.value >= PREMIUM_RATE, "Insufficient premium");
@@ -61,42 +88,60 @@ contract EthCreditDefaultSwap {
         emit ProtectionBought(msg.sender, protectionAmount, block.timestamp + PERIOD);
     }
 
+    // -------------------------------------------------------------------
+    // Trigger: check if payout condition is met
+    // -------------------------------------------------------------------
+
     function triggerCDS() external {
         Position storage pos = positions[msg.sender];
         require(pos.active, "No active position");
         require(block.timestamp <= pos.expiry, "Position expired");
 
         uint256 currentPrice = oracle.getEthUsdPrice();
-        require(currentPrice < STRIKE_PRICE, "ETH price above strike: currently $" );
+        require(currentPrice < STRIKE_PRICE, "ETH price above strike");
 
         pendingPayouts[msg.sender] += pos.protectionAmount;
         pos.active = false;
         totalProtectionPool -= pos.protectionAmount;
     }
 
-    // !! VULNERABLE FUNCTION — reentrancy bug intentionally present !!
-    // State (pendingPayouts) is updated AFTER the external .call{}
-    // allowing recursive re-entry before the balance is zeroed.
+    // -------------------------------------------------------------------
+    // !! VULNERABLE FUNCTION !!
+    //
+    // REENTRANCY BUG: ETH is transferred via call() BEFORE
+    // pendingPayouts[msg.sender] is zeroed out. A malicious contract's
+    // receive() function can re-enter claimPayout() repeatedly,
+    // draining the contract's entire balance.
+    //
+    // Fix would be: zero out pendingPayouts[msg.sender] BEFORE the call,
+    // or use a ReentrancyGuard modifier (checks-effects-interactions).
+    // -------------------------------------------------------------------
+
     function claimPayout() external {
         uint256 amount = pendingPayouts[msg.sender];
         require(amount > 0, "Nothing to claim");
 
-        // BUG: send ETH before updating state
+        // !! BUG: state is NOT updated before the external call !!
         (bool success, ) = msg.sender.call{value: amount}("");
         require(success, "Transfer failed");
 
-        // Too late — attacker has already re-entered multiple times by here
+        // State update happens AFTER the external call — too late!
         pendingPayouts[msg.sender] = 0;
 
         emit PayoutClaimed(msg.sender, amount);
     }
 
-    function setOracle(address _newOracle) external {
+    // -------------------------------------------------------------------
+    // Admin
+    // -------------------------------------------------------------------
+
+    function setOracle(address _oracle) external {
         require(msg.sender == owner, "Not owner");
-        oracle = UniswapV3TWAPOracle(_newOracle);
+        oracle = IOracle(_oracle);
     }
 
     receive() external payable {
         totalProtectionPool += msg.value;
     }
+}
 }
