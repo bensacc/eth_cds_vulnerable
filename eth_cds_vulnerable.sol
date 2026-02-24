@@ -144,4 +144,3 @@ contract EthCreditDefaultSwap {
         totalProtectionPool += msg.value;
     }
 }
-}
