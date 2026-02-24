@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+
 // --------------------------------------------------------------------
 // Uniswap V3 TWAP Oracle — reads from USDC/WETH 0.05% pool
 //
